@@ -1,127 +1,165 @@
-#define UNICODE
-#define _UNICODE
+#define _WIN32_WINNT 0x0603
 #include <windows.h>
 #include <sapi.h>
 #include <sphelper.h>
-#include <string>
-#include <chrono>
 
 #pragma comment(lib, "sapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
 
-HWND hLabel;
-std::chrono::steady_clock::time_point lastUpdate;
+// 窗口句柄
+HWND hWndSubtitle = NULL;
+HWND hTextDisplay = NULL;
+HFONT hFont = NULL;
 
-LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+// 语音识别接口
+ISpRecognizer* g_pReco = NULL;
+ISpRecoContext* g_pContext = NULL;
+ISpRecoGrammar* g_pGrammar = NULL;
+
+// 窗口消息回调
+LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_LBUTTONDOWN:
-        SendMessage(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-        break;
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        break;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            break;
+        default:
+            return DefWindowProc(hWnd, msg, wParam, lParam);
     }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
-}
-
-void UpdateSubtitle(const std::wstring& text) {
-    SetWindowTextW(hLabel, text.c_str());
-    ShowWindow(hLabel, SW_SHOW);
-    lastUpdate = std::chrono::steady_clock::now();
-}
-
-DWORD WINAPI HideThread(LPVOID) {
-    while (true) {
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(now - lastUpdate).count() > 3) {
-            ShowWindow(hLabel, SW_HIDE);
-        }
-        Sleep(300);
-    }
-}
-
-DWORD WINAPI SpeechThread(LPVOID) {
-    ISpRecognizer* recognizer = nullptr;
-    ISpRecoContext* context = nullptr;
-    ISpRecoGrammar* grammar = nullptr;
-
-    CoInitialize(NULL);
-
-    CoCreateInstance(CLSID_SpInprocRecognizer, NULL, CLSCTX_ALL, IID_ISpRecognizer, (void**)&recognizer);
-    recognizer->SetInput(NULL, TRUE);
-    recognizer->CreateRecoContext(&context);
-    context->CreateGrammar(1, &grammar);
-    grammar->LoadDictation(NULL, SPLO_STATIC);
-    grammar->SetDictationState(SPRS_ACTIVE);
-
-    CSpEvent event;
-
-    while (true) {
-        while (event.GetFrom(context) == S_OK) {
-            if (event.eEventId == SPEI_RECOGNITION) {
-                ISpRecoResult* result = event.RecoResult();
-                LPWSTR text;
-                result->GetText(SP_GETWHOLEPHRASE, SP_GETWHOLEPHRASE, FALSE, &text, NULL);
-                UpdateSubtitle(text);
-                CoTaskMemFree(text);
-            }
-        }
-        Sleep(50);
-    }
-
     return 0;
 }
 
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
-    const wchar_t CLASS_NAME[] = L"SubtitleWindow";
+// 更新字幕文字
+void SetSubtitleText(LPCWSTR text) {
+    if (hTextDisplay) {
+        SetWindowTextW(hTextDisplay, text);
+    }
+}
 
-    WNDCLASS wc = {};
+// 初始化 Win8.1 自带语音识别
+HRESULT InitSpeechRecognition(HWND hWnd) {
+    HRESULT hr;
+
+    // 初始化COM
+    hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) return hr;
+
+    // 创建识别引擎
+    hr = CoCreateInstance(CLSID_SpSharedRecognizer, NULL, CLSCTX_ALL, IID_ISpRecognizer, (void**)&g_pReco);
+    if (FAILED(hr)) return hr;
+
+    // 创建上下文
+    hr = g_pReco->CreateRecoContext(&g_pContext);
+    if (FAILED(hr)) return hr;
+
+    // 设置窗口接收消息
+    hr = g_pContext->SetMessageWindow(hWnd, WM_USER + 100);
+    if (FAILED(hr)) return hr;
+
+    // 创建语法
+    hr = g_pContext->CreateGrammar(1, &g_pGrammar);
+    if (FAILED(hr)) return hr;
+
+    // 加载 dictation 模式（自由听写）
+    hr = g_pGrammar->LoadDictation(NULL, SPLO_STATIC);
+    if (FAILED(hr)) return hr;
+
+    // 启用听写
+    hr = g_pGrammar->SetDictationState(SPRS_ACTIVE);
+    if (FAILED(hr)) return hr;
+
+    return S_OK;
+}
+
+// 处理识别结果
+void ProcessRecoResult(LPARAM lParam) {
+    SPEVENT eventItem;
+    ULONG eventCount = 0;
+    WCHAR resultBuf[1024] = { 0 };
+
+    while (SUCCEEDED(g_pContext->GetEvents(1, &eventItem, &eventCount)) && eventCount > 0) {
+        if (eventItem.eEventId == SPEI_RECOGNITION) {
+            ISpRecoResult* pResult = (ISpRecoResult*)eventItem.lParam;
+            pResult->GetText(SP_GETWHOLEPHRASE, SP_GETWHOLEPHRASE, TRUE, resultBuf, NULL);
+            SetSubtitleText(resultBuf);
+            pResult->Release();
+        }
+    }
+}
+
+// 主函数
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPSTR cmd, int nShow) {
+    // 1. 注册窗口
+    WNDCLASSEX wc = { 0 };
+    wc.cbSize = sizeof(WNDCLASSEX);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = CLASS_NAME;
-    RegisterClass(&wc);
+    wc.lpszClassName = L"SubtitleClass";
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    RegisterClassEx(&wc);
 
-    HWND hwnd = CreateWindowEx(
-        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        CLASS_NAME,
-        L"",
+    // 2. 创建悬浮字幕窗口（屏幕底部半透明）
+    int scrW = GetSystemMetrics(SM_CXSCREEN);
+    int winW = scrW - 200;
+    int winH = 140;
+
+    hWndSubtitle = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        L"SubtitleClass",
+        L"Real-time Subtitle",
         WS_POPUP,
-        200, 200, 1200, 120,
+        (scrW - winW) / 2,
+        GetSystemMetrics(SM_CYSCREEN) - winH - 40,
+        winW, winH,
         NULL, NULL, hInstance, NULL
     );
 
-    hLabel = CreateWindow(
-        L"STATIC",
-        L"",
-        WS_VISIBLE | WS_CHILD,
-        0, 0, 1200, 120,
-        hwnd, NULL, hInstance, NULL
+    // 设置透明度
+    SetLayeredWindowAttributes(hWndSubtitle, 0, 230, LWA_ALPHA);
+
+    // 3. 创建文字显示控件
+    hTextDisplay = CreateWindowExW(
+        0, L"STATIC", L"请开始说话...",
+        WS_CHILD | WS_VISIBLE | SS_CENTER,
+        0, 0, winW, winH,
+        hWndSubtitle, NULL, hInstance, NULL
     );
 
-    HFONT font = CreateFont(
-        50, 0, 0, 0, FW_BOLD,
+    // 4. 创建字体
+    hFont = CreateFontW(
+        56, 0, 0, 0, FW_NORMAL,
         FALSE, FALSE, FALSE,
         DEFAULT_CHARSET,
-        OUT_OUTLINE_PRECIS,
+        OUT_DEFAULT_PRECIS,
         CLIP_DEFAULT_PRECIS,
-        CLEARTYPE_QUALITY,
-        VARIABLE_PITCH,
-        L"Microsoft YaHei"
+        ANTIALIASED_QUALITY,
+        DEFAULT_PITCH,
+        L"Microsoft YaHei UI"
     );
-    SendMessage(hLabel, WM_SETFONT, (WPARAM)font, TRUE);
+    SendMessageW(hTextDisplay, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    SetWindowLong(hLabel, GWL_STYLE, SS_CENTER | WS_VISIBLE);
+    ShowWindow(hWndSubtitle, SW_SHOW);
+    UpdateWindow(hWndSubtitle);
 
-    ShowWindow(hwnd, SW_SHOW);
+    // 5. 初始化语音识别
+    InitSpeechRecognition(hWndSubtitle);
 
-    lastUpdate = std::chrono::steady_clock::now();
-    CreateThread(NULL, 0, HideThread, NULL, 0, NULL);
-    CreateThread(NULL, 0, SpeechThread, NULL, 0, NULL);
-
-    MSG msg = {};
+    // 6. 消息循环
+    MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
+        if (msg.message == WM_USER + 100) {
+            ProcessRecoResult(msg.lParam);
+        }
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
+    // 释放资源
+    DeleteObject(hFont);
+    if (g_pGrammar) g_pGrammar->Release();
+    if (g_pContext) g_pContext->Release();
+    if (g_pReco) g_pReco->Release();
+    CoUninitialize();
     return 0;
 }
