@@ -13,8 +13,8 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
-    - name: Add MSVC Build Tools
-      uses: microsoft/setup-msbuild@v2
+    - name: Setup MSVC Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
 
     - name: Compile subtitle.exe
       run: |
